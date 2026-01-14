@@ -20,13 +20,24 @@ const SHOW_REASONING = true; // Set to true to show reasoning with <think> tags
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
 const ENABLE_THINKING_MODE = true; // Set to true to enable chat_template_kwargs thinking parameter
 
-// Model mapping (Adjust these to actual available NVIDIA NIM models)
-// Note: Ensure the values on the right match actual NIM model IDs found in NVIDIA API
+// Model mapping configuration
+// Maps incoming "model" names to the actual NVIDIA NIM model IDs
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
-  'gpt-4': 'meta/llama-3.1-70b-instruct',
-  'gpt-4-turbo': 'meta/llama-3.1-405b-instruct',
-  'gpt-4o': 'deepseek-ai/deepseek-r1',
+  // --- User Requested Mappings ---
+  'gpt-3.5-turbo': 'z-ai/glm4.7',
+  'gpt-4': 'deepseek-ai/deepseek-v3.2',
+  'gpt-4o': 'deepseek-ai/deepseek-v3.1-terminus', // Assuming '3.1-terminus' maps here, or use '3.1-terminus' directly
+  
+  // --- Direct Access keys (Allowing explicit request of these models) ---
+  'z-ai/glm4.7': 'z-ai/glm4.7',
+  'glm4.7': 'z-ai/glm4.7',
+  
+  'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
+  'deepseek-ai/deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
+  
+  '3.1-terminus': '3.1-terminus', // Ensure this ID exists in your API provider, or map to 'deepseek-ai/deepseek-v3.1'
+  
+  // --- Standard Fallbacks / Other Models ---
   'claude-3-opus': 'meta/llama-3.1-405b-instruct',
   'claude-3-sonnet': 'meta/llama-3.1-70b-instruct',
   'deepseek-r1': 'deepseek-ai/deepseek-r1'
@@ -62,22 +73,27 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // 1. Smart model selection with fallback
+    // 1. Smart model selection
     let nimModel = MODEL_MAPPING[model];
     
-    // If no direct map, check if the client sent a valid NIM ID directly, or fallback
+    // If no direct map found, check logic or passthrough
     if (!nimModel) {
-        // Simple heuristic fallback based on name
+      // If the model name is already a valid NIM ID (like "deepseek-ai/..."), use it directly
+      if (model.includes('/') || model.includes('terminus')) {
+        nimModel = model;
+      } else {
+        // Fallback logic for unmapped aliases
         const modelLower = model.toLowerCase();
-        if (modelLower.includes('deepseek')) {
-            nimModel = 'deepseek-ai/deepseek-r1';
-        } else if (modelLower.includes('405b') || modelLower.includes('gpt-4') || modelLower.includes('opus')) {
-            nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('70b') || modelLower.includes('claude')) {
-            nimModel = 'meta/llama-3.1-70b-instruct';
+        if (modelLower.includes('gpt-4') || modelLower.includes('opus')) {
+          nimModel = 'deepseek-ai/deepseek-v3.2';
+        } else if (modelLower.includes('terminus')) {
+          nimModel = '3.1-terminus';
+        } else if (modelLower.includes('glm')) {
+          nimModel = 'z-ai/glm4.7';
         } else {
-            nimModel = 'meta/llama-3.1-8b-instruct'; // Safe default
+          nimModel = 'z-ai/glm4.7'; // Default fallback
         }
+      }
     }
     
     console.log(`Proxying ${model} -> ${nimModel} (Stream: ${stream})`);
@@ -88,7 +104,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages: messages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 4096,
-      // Only inject extra_body if specific models need it (like DeepSeek via NIM)
       extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
@@ -113,7 +128,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
-        const lines = buffer.split('\n'); // Fixed: Use actual newline char, not escaped string
+        const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         
         lines.forEach(line => {
@@ -122,7 +137,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             const dataStr = line.slice(6);
             
             if (dataStr.trim() === '[DONE]') {
-              // If we were reasoning and stream ends, close the tag
               if (SHOW_REASONING && reasoningStarted) {
                  const closingChunk = {
                     id: "closing-think",
@@ -139,62 +153,39 @@ app.post('/v1/chat/completions', async (req, res) => {
             
             try {
               const data = JSON.parse(dataStr);
-              
               if (data.choices && data.choices[0].delta) {
                 const delta = data.choices[0].delta;
-                const reasoning = delta.reasoning_content; // NVIDIA/DeepSeek standard
+                const reasoning = delta.reasoning_content;
                 const content = delta.content;
                 
                 if (SHOW_REASONING) {
-                  // --- SHOW REASONING LOGIC ---
                   let newContent = '';
                   
-                  // Start of reasoning phase
                   if (reasoning && !reasoningStarted) {
                     newContent += '<think>\n' + reasoning;
                     reasoningStarted = true;
-                  } 
-                  // Continuing reasoning phase
-                  else if (reasoning) {
+                  } else if (reasoning) {
                     newContent += reasoning;
                   }
                   
-                  // Transition from reasoning to content
                   if (content && reasoningStarted) {
                     newContent += '\n</think>\n\n' + content;
                     reasoningStarted = false;
-                  } 
-                  // Just content
-                  else if (content) {
+                  } else if (content) {
                     newContent += content;
                   }
                   
-                  // Modify the delta to send to client
                   if (newContent) {
                     delta.content = newContent;
-                    delete delta.reasoning_content; // Remove non-standard field
-                    res.write(`data: ${JSON.stringify(data)}\n\n`);
-                  }
-                  
-                } else {
-                  // --- HIDE REASONING LOGIC ---
-                  // If we are hiding reasoning, we must NOT send empty packets for reasoning-only chunks
-                  if (reasoning) {
                     delete delta.reasoning_content;
-                  }
-                  
-                  if (content) {
-                    // Normal content chunk
                     res.write(`data: ${JSON.stringify(data)}\n\n`);
-                  } 
-                  // If content is empty/null, we simply skip writing to the stream
-                  // to prevent client-side "empty message" errors.
+                  }
+                } else {
+                  if (reasoning) delete delta.reasoning_content;
+                  if (content) res.write(`data: ${JSON.stringify(data)}\n\n`);
                 }
               }
-            } catch (e) {
-              // If parsing fails, just pass the line through (fallback)
-              console.warn('Parse error:', e.message);
-            }
+            } catch (e) { }
           }
         });
       });
@@ -214,34 +205,22 @@ app.post('/v1/chat/completions', async (req, res) => {
         model: model,
         choices: response.data.choices.map(choice => {
           let fullContent = choice.message?.content || '';
-          
           if (SHOW_REASONING && choice.message?.reasoning_content) {
             fullContent = `<think>\n${choice.message.reasoning_content}\n</think>\n\n${fullContent}`;
           }
-          
           return {
             index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
+            message: { role: choice.message.role, content: fullContent },
             finish_reason: choice.finish_reason
           };
         }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
+        usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       };
-      
       res.json(openaiResponse);
     }
     
   } catch (error) {
     console.error('Proxy error:', error.message);
-    if(error.response) console.error('Response data:', error.response.data);
-    
     res.status(error.response?.status || 500).json({
       error: {
         message: error.message || 'Internal server error',
@@ -252,13 +231,9 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// Catch-all
-app.all('*', (req, res) => {
-  res.status(404).json({ error: { message: `Endpoint ${req.path} not found` } });
-});
+app.all('*', (req, res) => res.status(404).json({ error: { message: `Endpoint ${req.path} not found` } }));
 
 app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Supported custom models: z-ai/glm4.7, deepseek-v3.2, 3.1-terminus`);
 });
