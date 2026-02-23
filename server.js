@@ -1,174 +1,101 @@
-// server.js - Render/JanitorAI Optimized Proxy
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// --- CRITICAL: CORS SETUP FOR JANITORAI/CHUB ---
+// 1. IMPROVED CORS (More explicit for browser-based frontends)
 app.use(cors({
-  origin: '*', // Allow all origins (JanitorAI, Chub, Localhost)
-  methods: ['GET', 'POST', 'OPTIONS'], // Allow these HTTP methods
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'], // Allow Auth headers
-  credentials: true
+  origin: true, // Reflects the request origin, better for some browsers than '*'
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'OpenAI-Organization'] 
 }));
 
-app.use(express.json());
+// Handle OPTIONS preflight explicitly
+app.options('*', cors());
 
-// --- CONFIGURATION ---
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY; // Make sure this is set in Render Env Vars!
-
-const SHOW_REASONING = true; 
-const ENABLE_THINKING_MODE = true;
-
-// --- MODEL MAPPINGS ---
-const MODEL_MAPPING = {
-  // Aliases for JanitorAI/Chub
-  'gpt-3.5-turbo': 'z-ai/glm4.7',
-  'gpt-4': 'deepseek-ai/deepseek-v3.2',
-  'gpt-4o': 'deepseek-ai/deepseek-v3.1-terminus', // Ensure this ID is valid on NVIDIA, or map to 'meta/llama-3.1-70b-instruct'
-  
-  // Direct access
-  'z-ai/glm4.7': 'z-ai/glm4.7',
-  'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
-  '3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus', // Placeholder ID
-  
-  // Fallbacks
-  'claude-3-opus': 'meta/llama-3.1-405b-instruct',
-  'claude-3-sonnet': 'meta/llama-3.1-70b-instruct'
-};
-
-// --- HEALTH CHECK ---
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Render Proxy Active', models_loaded: Object.keys(MODEL_MAPPING).length });
-});
-
-// --- LIST MODELS ---
-app.get('/v1/models', (req, res) => {
-  const models = Object.keys(MODEL_MAPPING).map(id => ({
-    id: id, object: 'model', created: Date.now(), owned_by: 'proxy'
-  }));
-  res.json({ object: 'list', data: models });
-});
-
-// --- CHAT GENERATION ---
+// 2. OPTIMIZED CHAT COMPLETIONS
 app.post('/v1/chat/completions', async (req, res) => {
-  // 1. Log Incoming Request (Check Render Logs if this doesn't appear)
-  console.log(`[INCOMING] Model: ${req.body.model} | Stream: ${req.body.stream}`);
+  console.log(`[REQUEST] Model: ${req.body.model} | Stream: ${req.body.stream}`);
 
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Model Selection Logic
-    let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
-      // Fallback heuristics
-      const lower = model.toLowerCase();
-      if (lower.includes('glm')) nimModel = 'z-ai/glm4.7';
-      else if (lower.includes('deepseek')) nimModel = 'deepseek-ai/deepseek-v3.2';
-      else nimModel = 'meta/llama-3.1-70b-instruct';
-    }
+    let nimModel = MODEL_MAPPING[model] || 'meta/llama-3.1-70b-instruct';
 
     const nimRequest = {
       model: nimModel,
       messages: messages,
       temperature: temperature || 0.7,
       max_tokens: max_tokens || 4096,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
 
-    // 2. Request to NVIDIA
+    // Add thinking mode only if requested
+    if (ENABLE_THINKING_MODE) {
+      nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
+    }
+
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
         'Content-Type': 'application/json'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 120000 // 2 minute timeout
+      timeout: 120000 
     });
 
     if (stream) {
-      // --- CRITICAL FOR RENDER: DISABLE BUFFERING ---
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no'); // <--- FIXES RENDER STREAMING ISSUES
+      res.setHeader('X-Accel-Buffering', 'no'); 
 
-      let buffer = '';
       let reasoningStarted = false;
 
       response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        const payload = chunk.toString();
+        const lines = payload.split('\n');
 
-        lines.forEach(line => {
-          if (line.trim() === '') return;
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6);
-            if (dataStr.trim() === '[DONE]') {
-              if (SHOW_REASONING && reasoningStarted) {
-                 res.write(`data: ${JSON.stringify({
-                    choices: [{ delta: { content: "\n</think>\n\n" } }]
-                 })}\n\n`);
+        for (let line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          if (line.includes('[DONE]')) {
+            res.write('data: [DONE]\n\n');
+            continue;
+          }
+
+          try {
+            const data = JSON.parse(line.replace('data: ', ''));
+            const delta = data.choices[0].delta;
+
+            // Merge Reasoning into Content (Crucial for Chub to see DeepSeek "thoughts")
+            if (SHOW_REASONING) {
+              if (delta.reasoning_content) {
+                if (!reasoningStarted) {
+                  delta.content = "<think>\n" + delta.reasoning_content;
+                  reasoningStarted = true;
+                } else {
+                  delta.content = delta.reasoning_content;
+                }
+                delete delta.reasoning_content;
+              } else if (delta.content && reasoningStarted) {
+                delta.content = "\n</think>\n\n" + delta.content;
+                reasoningStarted = false;
               }
-              res.write('data: [DONE]\n\n');
-              return;
             }
 
-            try {
-              const data = JSON.parse(dataStr);
-              if (data.choices?.[0]?.delta) {
-                const delta = data.choices[0].delta;
-                
-                // Reasoning logic
-                if (SHOW_REASONING) {
-                  let contentPayload = "";
-                  if (delta.reasoning_content) {
-                    if (!reasoningStarted) { contentPayload += "<think>\n"; reasoningStarted = true; }
-                    contentPayload += delta.reasoning_content;
-                  }
-                  if (delta.content) {
-                    if (reasoningStarted) { contentPayload += "\n</think>\n\n"; reasoningStarted = false; }
-                    contentPayload += delta.content;
-                  }
-                  
-                  if (contentPayload) {
-                    delta.content = contentPayload;
-                    delete delta.reasoning_content;
-                    res.write(`data: ${JSON.stringify(data)}\n\n`);
-                  }
-                } else {
-                    // Standard pass-through
-                    if(delta.content) res.write(`data: ${JSON.stringify(data)}\n\n`);
-                }
-              }
-            } catch (e) {}
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+          } catch (e) {
+            // Silently skip partial/malformed JSON chunks
           }
-        });
+        }
       });
 
       response.data.on('end', () => res.end());
-      response.data.on('error', (err) => { console.error('Stream Error:', err); res.end(); });
-
     } else {
       res.json(response.data);
     }
 
   } catch (error) {
-    // --- DETAILED ERROR LOGGING ---
-    console.error('API Error:', error.message);
-    if (error.response) {
-        console.error('NVIDIA Response Status:', error.response.status);
-        console.error('NVIDIA Response Data:', JSON.stringify(error.response.data, null, 2));
-        
-        return res.status(error.response.status).json(error.response.data);
-    }
-    res.status(500).json({ error: { message: "Proxy Connection Failed" } });
+    console.error('Proxy Error:', error.response?.data || error.message);
+    // Ensure we ALWAYS return a JSON error so Chub doesn't see "Empty Response"
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { error: { message: "Internal Proxy Error" } }
+    );
   }
 });
-
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
