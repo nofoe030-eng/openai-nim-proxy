@@ -22,7 +22,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'z-ai/glm4.7',
   'gpt-4': 'z-ai/glm5',
-  'gpt-4o': 'deepseek-ai/deepseek-v3.2',
+  'gpt-4o': 'moonshotai/kimi-k2.5',
   'claude-3-opus': 'meta/llama-3.1-405b-instruct',
   'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2'
 };
